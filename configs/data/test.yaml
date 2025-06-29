@@ -1,0 +1,15 @@
+data_name: test
+_target_: src.data.gene_mask_dataset.TestDataModule
+image_size: 184
+batch_size: ${machine.batch_size}
+num_workers: ${machine.num_workers}
+tokenier: "ncbi_bert"
+mask_ratio: 0.5
+h5_paths:
+  train: ${paths.datasets_dir}/Test/GSM5519464.h5
+  test: None
+  val: ${paths.datasets_dir}/Test/GSM5519464.h5
+txt_paths:
+  train: ${paths.datasets_dir}/Test/GSM5519464.txt
+  test: None
+  val: ${paths.datasets_dir}/Test/GSM5519464.txt

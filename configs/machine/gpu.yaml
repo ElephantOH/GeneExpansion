@@ -1,0 +1,7 @@
+defaults:
+  - default.yaml
+
+accelerator: gpu
+devices: 1
+batch_size: 16
+num_workers: 8

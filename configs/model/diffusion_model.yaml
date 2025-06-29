@@ -1,0 +1,18 @@
+
+_target_: src.model.diffusion_model
+channel: 1
+text_encoder: "ncbi_bert"
+train_text_encoder: False
+cross_attention_dim: 768
+layers_per_block: 2
+block_out_channels: (128, 256, 512, 1024)
+norm_num_groups: 8
+time_embedding_type: "positional"
+loss:
+  gene_corr_weight: 0.3
+optim:
+  lr: 1e-4
+  weight_decay: 1e-5
+
+model:
+  _target_: src.model.diffusion_model.DiffusionModel
