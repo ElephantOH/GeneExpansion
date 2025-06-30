@@ -1,0 +1,19 @@
+
+defaults:
+  - _self_
+  - data: test
+  - machine: gpu
+  - model: diffusion_model_large
+  - optimizer: adamw
+  - scheduler: cosine
+
+train:
+  seed: 42
+  max_epochs: 40
+
+is_val: True
+
+log:
+  log_interval: 30
+  project: "GeneDiffusion"
+  dir: "logs/geneset_expansion"

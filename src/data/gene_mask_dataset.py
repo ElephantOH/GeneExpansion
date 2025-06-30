@@ -17,6 +17,30 @@ from hydra.utils import instantiate
 import torch.nn.functional as F
 from einops import rearrange
 
+def fix_file(file_path):
+    try:
+        with open(file_path, 'rb') as f:
+            head = f.read(3)
+            has_bom = head == b'\xef\xbb\xbf'
+
+        if has_bom or not head:
+            with open(file_path, 'r', encoding='utf-8-sig' if has_bom else 'utf-8') as f:
+                content = f.read()
+
+            with open(file_path, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(content)
+
+            action = "BOM removed" if has_bom else "LF normalized"
+            print(f"Fixed: {file_path} ({action})")
+        else:
+            print(f"Skip: {file_path} (no BOM needed)")
+
+    except UnicodeDecodeError:
+        import os
+        new_path = os.path.splitext(file_path)[0] + '.rom'
+        os.rename(file_path, new_path)
+        print(f"Converted to ROM: {new_path}")
+
 class GeneMaskDataModule(LightningDataModule):
 
     def __init__(
@@ -142,6 +166,8 @@ class GeneMaskDataset(Dataset):
         self.mask_ratio = mask_ratio
         self.data_min = data_min
         self.data_max = data_max
+
+        fix_file(os.path.join(tokenier, "vocab.txt"))
         self.tokenizer = BertTokenizer.from_pretrained(tokenier)
 
     def __len__(self):
@@ -208,4 +234,5 @@ class GeneMaskDataset(Dataset):
             "text_attention_mask": text_input.attention_mask.squeeze(0),
             "text_desc": text_desc
         }
+
         return return_dict

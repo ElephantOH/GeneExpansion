@@ -3,25 +3,22 @@ import os
 import time
 import shutil
 import hydra
-import torch
-import numpy as np
-from omegaconf import DictConfig, OmegaConf
-import pytorch_lightning as pl
+from omegaconf import DictConfig
 from pytorch_lightning import seed_everything
-from lightning_fabric.fabric import Fabric
-from diffusers import UNet2DConditionModel, DDPMScheduler, DDIMScheduler
 from tqdm import tqdm
-from transformers import BertModel, BertTokenizer
-from torch.utils.data import Dataset, DataLoader
 from hydra.utils import instantiate
-import torch.nn.functional as F
-from einops import rearrange
-
 from src.tool.utils import calculate_model_params
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="gene_diffusion")
+@hydra.main(version_base=None, config_path="configs", config_name="gene_expansion")
 def main(cfg: DictConfig):
+    import torch
+    print(f"支持的架构: {torch.cuda.get_arch_list()}")
+    print(f"设备架构: {torch.cuda.get_device_capability(0)}")
+    print(f"设备名称: {torch.cuda.get_device_name(0)}")
+
+    os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+    os.environ['HF_MIRROR'] = 'https://hf-mirror.com'
     os.environ["HYDRA_FULL_ERROR"] = str(1)
 
     # 初始化Fabric (用于分布式训练)

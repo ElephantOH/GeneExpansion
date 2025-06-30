@@ -15,6 +15,7 @@ class DiffusionModel(LightningModule):
 
         # 文本编码器 (冻结预训练权重)
         self.text_encoder = BertModel.from_pretrained(self.config.text_encoder)
+        # self.text_encoder.save_pretrained(self.config.text_encoder, safe_serialization=True)
         for param in self.text_encoder.parameters():
             param.requires_grad = self.config.train_text_encoder
 
@@ -65,11 +66,7 @@ class DiffusionModel(LightningModule):
 
         # 添加噪声
         noise = torch.randn_like(clean_genes)
-        timesteps = torch.randint(
-            0, self.noise_scheduler.config.num_train_timesteps,
-            (clean_genes.shape[0],), device=self.device
-        )
-
+        timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (clean_genes.shape[0],), device=self.device)
         noisy_genes = self.noise_scheduler.add_noise(clean_genes, noise, timesteps)
 
         # 模型预测
@@ -77,10 +74,6 @@ class DiffusionModel(LightningModule):
 
         # 基础MSE损失
         mse_loss = F.mse_loss(pred_noise, noise)
-
-        # 基因相关性损失 (仅对预测值计算)
-        # pred_genes = self.predict_x0(noisy_genes, pred_noise, timesteps)
-        # gene_corr_loss = self.calculate_gene_correlation_loss(pred_genes, clean_genes, mask)
 
         # 总损失
         total_loss = mse_loss
