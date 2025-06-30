@@ -11,3 +11,11 @@ output_dir: ${hydra:runtime.output_dir}
 
 # path to dataset directory
 datasets_dir: ${hydra:runtime.cwd}/datasets/
+
+precision: "32-true"
+
+fabric:
+  _target_: lightning.Fabric
+  accelerator: ${machine.accelerator}
+  devices: ${machine.devices}
+  precision: ${machine.precision}

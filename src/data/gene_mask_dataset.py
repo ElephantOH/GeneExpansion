@@ -23,10 +23,12 @@ class GeneMaskDataModule(LightningDataModule):
         self,
         batch_size: int,
         num_workers: int = 4,
-        image_size: int = 384,
+        image_size: int = 184,
         pin_memory: bool = True,
         tokenier: str = "ncbi_bert",
         mask_ratio: float = 0.5,
+        data_min: float = 0.0,
+        data_max: float = 6.0,
         h5_paths: dict = {"train": "", "test": "", "val": ""},
         txt_paths: dict = {"train": "", "test": "", "val": ""},
         **kwargs,  # type: ignore
@@ -42,28 +44,36 @@ class GeneMaskDataModule(LightningDataModule):
         self.tokenier = tokenier
         self.pin_memory = pin_memory
         self.mask_ratio = mask_ratio
+        self.data_min = data_min
+        self.data_max = data_max
 
         self.train_dataset = GeneMaskDataset(
-            h5_path=self.txt_paths["train"],
+            h5_path=self.h5_paths["train"],
             txt_path=self.txt_paths["train"],
             tokenier=self.tokenier,
             mask_ratio=self.mask_ratio,
+            data_min=self.data_min,
+            data_max=self.data_max,
         )
 
-        if self.h5_paths["test"] is not "None" and self.txt_paths["test"] is not "None":
+        if self.h5_paths["test"] != "None" and self.txt_paths["test"] != "None":
             self.test_dataset = GeneMaskDataset(
-                h5_path=self.txt_paths["test"],
+                h5_path=self.h5_paths["test"],
                 txt_path=self.txt_paths["test"],
                 tokenier=self.tokenier,
                 mask_ratio=self.mask_ratio,
+                data_min=self.data_min,
+                data_max=self.data_max,
             )
 
-        if self.h5_paths["val"] is not "None" and self.txt_paths["val"] is not "None":
+        if self.h5_paths["val"] != "None" and self.txt_paths["val"] != "None":
             self.val_dataset = GeneMaskDataset(
-                h5_path=self.txt_paths["val"],
+                h5_path=self.h5_paths["val"],
                 txt_path=self.txt_paths["val"],
                 tokenier=self.tokenier,
                 mask_ratio=self.mask_ratio,
+                data_min=self.data_min,
+                data_max=self.data_max,
             )
 
     def train_dataloader(self):
@@ -101,6 +111,7 @@ class GeneMaskDataset(Dataset):
 
     # 读数据集文件（h5文件和txt信息）
     def read_data(self, h5_path, txt_path):
+
         adata = sc.read_10x_h5(h5_path)
         obs_df = pd.read_csv(txt_path, sep="\t", index_col=0)
         if not obs_df.index.equals(adata.obs_names):
@@ -116,7 +127,9 @@ class GeneMaskDataset(Dataset):
                  h5_path,
                  txt_path,
                  tokenier,
-                 mask_ratio=0.5):
+                 mask_ratio,
+                 data_min,
+                 data_max):
         """
         基因掩码数据集
         """
@@ -127,6 +140,8 @@ class GeneMaskDataset(Dataset):
         print(f"[Info] Gene. Matrix Size: {self.get_gene_size()}")
 
         self.mask_ratio = mask_ratio
+        self.data_min = data_min
+        self.data_max = data_max
         self.tokenizer = BertTokenizer.from_pretrained(tokenier)
 
     def __len__(self):
@@ -164,9 +179,13 @@ class GeneMaskDataset(Dataset):
         gene_matrix = torch.tensor(self.reshape_gene(self.adata, idx), dtype=torch.float32)
         gene_matrix = rearrange(gene_matrix, 'h w -> 1 h w')  # 添加通道维度
 
+        gene_matrix = torch.clamp(gene_matrix, min=self.data_min, max=self.data_max)
+        resize_value = (self.data_max - self.data_min) / 2.
+        gene_matrix = (gene_matrix - resize_value) / resize_value
+
         # 生成随机掩码 (0=缺失, 1=已知)
         gene_mask = torch.ones_like(gene_matrix)
-        gene_mask[:, int(gene_mask.shape[1] * (1 - self.mask_ratio)):] = 0  # 模拟底部区域的缺失
+        # gene_mask[:, int(gene_mask.shape[1] * (1 - self.mask_ratio)):] = 0  # 模拟底部区域的缺失
 
         # 提取文本描述
         cell_type = self.adata.obs.iloc[idx]["cell_type"]
@@ -181,12 +200,12 @@ class GeneMaskDataset(Dataset):
             truncation=True,
             return_tensors="pt"
         )
-
-        return {
+        return_dict = {
             "gene_matrix": gene_matrix,
             "gene_mask": gene_mask,
-            "focus_mask": None,
+            "focus_mask": gene_mask,
             "text_input_ids": text_input.input_ids.squeeze(0),
             "text_attention_mask": text_input.attention_mask.squeeze(0),
             "text_desc": text_desc
         }
+        return return_dict

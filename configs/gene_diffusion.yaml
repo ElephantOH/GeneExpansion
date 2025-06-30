@@ -1,18 +1,19 @@
 
-paths: ${machine.paths}
-
 defaults:
   - _self_
-  - dataset: test
+  - data: test
   - machine: gpu
   - model: diffusion_model
+  - optimizer: adamw
+  - scheduler: cosine
 
 train:
   seed: 42
-  epochs: 100
+  max_epochs: 100
 
 is_val: True
 
-logging:
+log:
+  log_interval: 30
   project: "GeneDiffusion"
   dir: "logs/geneset_expansion"

@@ -1,18 +1,29 @@
 
-_target_: src.model.diffusion_model
-channel: 1
-text_encoder: "ncbi_bert"
-train_text_encoder: False
-cross_attention_dim: 768
-layers_per_block: 2
-block_out_channels: (128, 256, 512, 1024)
-norm_num_groups: 8
-time_embedding_type: "positional"
-loss:
-  gene_corr_weight: 0.3
-optim:
-  lr: 1e-4
-  weight_decay: 1e-5
+_target_: src.model.diffusion_model.DiffusionModel
+model_config:
+  max_epochs: ${train.max_epochs}
+  sample_size: ${data.image_size}
+  in_channel: 1
+  out_channel: 1
+  text_encoder: "lighteternal/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext-finetuned-mnli"
+  train_text_encoder: False
+  cross_attention_dim: 768
+  layers_per_block: 2
+  block_out_channels: [ 64, 128, 256 ]
+  down_block_types:
+    - "DownBlock2D"         # 常规下采样模块
+    - "CrossAttnDownBlock2D"  # 带交叉注意力的模块
+    - "CrossAttnDownBlock2D"  # 建议至少2层带注意力
+  up_block_types:
+    - "CrossAttnUpBlock2D"
+    - "CrossAttnUpBlock2D"
+    - "UpBlock2D"           # 常规上采样模块
+  norm_num_groups: 32        # 需能被通道数整除
+  time_embedding_type: "positional"
 
-model:
-  _target_: src.model.diffusion_model.DiffusionModel
+  loss:
+    gene_corr_weight: 0.3
+
+  optim:
+    lr: 1e-4
+    weight_decay: 1e-5

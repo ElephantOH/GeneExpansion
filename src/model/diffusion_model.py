@@ -1,37 +1,35 @@
-import os
-import hydra
 import torch
-import numpy as np
-from omegaconf import DictConfig, OmegaConf
-import pytorch_lightning as pl
-from pytorch_lightning import seed_everything
-from lightning_fabric.fabric import Fabric
+from omegaconf import DictConfig
+from pytorch_lightning import LightningModule
 from diffusers import UNet2DConditionModel, DDPMScheduler
-from transformers import BertModel, BertTokenizer
-from torch.utils.data import Dataset, DataLoader
+from transformers import BertModel
 import torch.nn.functional as F
 from einops import rearrange
 
-class DiffusionModel(pl.LightningModule):
-    def __init__(self, config):
+class DiffusionModel(LightningModule):
+    def __init__(self, model_config: DictConfig):
         super().__init__()
-        self.save_hyperparameters(config)
+
+        self.config = model_config
+        self.save_hyperparameters(self.config)
 
         # 文本编码器 (冻结预训练权重)
-        self.text_encoder = BertModel.from_pretrained(config.model.text_encoder)
+        self.text_encoder = BertModel.from_pretrained(self.config.text_encoder)
         for param in self.text_encoder.parameters():
-            param.requires_grad = self.hparams.train_text_encoder
+            param.requires_grad = self.config.train_text_encoder
 
         # 扩散模型UNet - 基于RePaint/Palette架构
         self.unet = UNet2DConditionModel(
-            sample_size=config.dataset.image_size,
-            in_channels=config.model.channel,  # 单通道基因"图像"
-            out_channels=config.model.channel,
-            cross_attention_dim=config.model.cross_attention_dim,  # 文本向量维度
-            layers_per_block=config.model.layers_per_block,
-            block_out_channels=config.model.block_out_channels,
-            norm_num_groups=config.model.norm_num_groups,
-            time_embedding_type=config.model.time_embedding_type,
+            sample_size=self.config.sample_size,
+            in_channels=self.config.in_channel,
+            out_channels=self.config.out_channel,
+            cross_attention_dim=self.config.cross_attention_dim,  # 文本向量维度
+            layers_per_block=self.config.layers_per_block,
+            block_out_channels=self.config.block_out_channels,
+            down_block_types=self.config.down_block_types,
+            up_block_types=self.config.up_block_types,
+            norm_num_groups=self.config.norm_num_groups,
+            time_embedding_type=self.config.time_embedding_type,
         )
 
         # 噪声调度器
@@ -42,21 +40,18 @@ class DiffusionModel(pl.LightningModule):
         )
 
         # 自定义损失权重
-        self.gene_corr_loss_weight = config.model.loss.gene_corr_weight
+        self.gene_corr_loss_weight = self.config.loss.gene_corr_weight
 
-    def forward(self, noisy_genes, timesteps, mask, text_emb, text_mask):
-        # 拼接条件输入 (基因矩阵 + 掩码 + 文本特征)
-        model_input = torch.cat([noisy_genes, mask], dim=1)
-
+    def unconditional_forward(self, noisy_genes, timesteps, text_emb, text_mask):
         # U-Net前向传播 (文本条件)
         return self.unet(
-            model_input,
+            noisy_genes,
             timesteps,
             encoder_hidden_states=text_emb,
             encoder_attention_mask=text_mask
         ).sample
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch, batch_idx, fabric=None):
         # 准备数据
         clean_genes = batch["gene_matrix"]
         mask = batch["gene_mask"]
@@ -78,22 +73,17 @@ class DiffusionModel(pl.LightningModule):
         noisy_genes = self.noise_scheduler.add_noise(clean_genes, noise, timesteps)
 
         # 模型预测
-        pred_noise = self.forward(noisy_genes, timesteps, mask, text_emb, batch["text_attention_mask"])
+        pred_noise = self.unconditional_forward(noisy_genes, timesteps, text_emb, batch["text_attention_mask"])
 
         # 基础MSE损失
         mse_loss = F.mse_loss(pred_noise, noise)
 
         # 基因相关性损失 (仅对预测值计算)
-        pred_genes = self.predict_x0(noisy_genes, pred_noise, timesteps)
-        gene_corr_loss = self.calculate_gene_correlation_loss(pred_genes, clean_genes, mask)
+        # pred_genes = self.predict_x0(noisy_genes, pred_noise, timesteps)
+        # gene_corr_loss = self.calculate_gene_correlation_loss(pred_genes, clean_genes, mask)
 
         # 总损失
-        total_loss = mse_loss + self.gene_corr_loss_weight * gene_corr_loss
-
-        # 记录指标
-        self.log("train/mse_loss", mse_loss, prog_bar=True)
-        self.log("train/gene_corr_loss", gene_corr_loss)
-        self.log("train/total_loss", total_loss)
+        total_loss = mse_loss
 
         return total_loss
 
@@ -226,20 +216,3 @@ class DiffusionModel(pl.LightningModule):
 
         # 返回最终预测
         return noisy_genes.detach().cpu()
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": self.unet.parameters()},
-                {"params": self.text_encoder.parameters() if self.hparams.train_text_encoder else []}
-            ],
-            lr=self.hparams.optim.lr,
-            weight_decay=self.hparams.optim.weight_decay
-        )
-
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.trainer.max_epochs
-        )
-
-        return [optimizer], [scheduler]

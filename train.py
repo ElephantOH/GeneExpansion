@@ -1,4 +1,7 @@
+import datetime
 import os
+import time
+import shutil
 import hydra
 import torch
 import numpy as np
@@ -7,6 +10,7 @@ import pytorch_lightning as pl
 from pytorch_lightning import seed_everything
 from lightning_fabric.fabric import Fabric
 from diffusers import UNet2DConditionModel, DDPMScheduler, DDIMScheduler
+from tqdm import tqdm
 from transformers import BertModel, BertTokenizer
 from torch.utils.data import Dataset, DataLoader
 from hydra.utils import instantiate
@@ -18,50 +22,130 @@ from src.tool.utils import calculate_model_params
 
 @hydra.main(version_base=None, config_path="configs", config_name="gene_diffusion")
 def main(cfg: DictConfig):
+    os.environ["HYDRA_FULL_ERROR"] = str(1)
+
     # 初始化Fabric (用于分布式训练)
-    fabric = Fabric(accelerator="auto", devices=cfg.hardware.devices)
+    fabric = instantiate(cfg.machine.fabric)
     fabric.launch()
 
     # 设置随机种子
-    seed_everything(cfg.training.seed)
+    seed_everything(cfg.train.seed)
 
     # 创建数据模块
-    dataset = instantiate(cfg.dataset, _recursive_=False)
+    dataset = instantiate(cfg.data, _recursive_=False)
 
     train_dataloader = fabric.setup_dataloaders(dataset.train_dataloader())
     if cfg.is_val:
         val_dataloader = fabric.setup_dataloaders(dataset.val_dataloader())
 
     # 创建模型
-    model = instantiate(cfg.model, config=cfg)
+    model = instantiate(cfg.model)
+    print(type(model))
     calculate_model_params(model)
 
-    # 日志设置
-    logger = pl.loggers.WandbLogger(
-        project=cfg.logging.project,
-        save_dir=cfg.logging.dir,
-        log_model=True
+    optimizer = instantiate(
+        cfg.optimizer, params=model.parameters(), _partial_=False
     )
+    model, optimizer = fabric.setup(model, optimizer)
 
-    # 创建训练器
-    trainer = pl.Trainer(
-        logger=logger,
-        max_epochs=cfg.training.epochs,
-        callbacks=[
-            pl.callbacks.ModelCheckpoint(
-                dirpath=os.path.join(cfg.logging.dir, "checkpoints"),
-                monitor="val/mse",
-                mode="min",
-                save_top_k=3
-            ),
-            pl.callbacks.LearningRateMonitor(logging_interval="epoch")
-        ],
-        enable_model_summary=True,
-        deterministic=True
-    )
+    scheduler = instantiate(cfg.scheduler)
 
-    # 使用Fabric包装模型
-    model, optimizer = fabric.setup(model, model.configure_optimizers()[0])
+    fabric.print("Start training")
+    start_time = time.time()
 
-    # 训练模型
-    trainer.fit(model, train_dataloader, val_dataloader)
+    for epoch in range(cfg.train.max_epochs):
+        scheduler(optimizer, epoch)
+
+        columns = shutil.get_terminal_size().columns
+        fabric.print("-" * columns)
+        fabric.print(f"Epoch {epoch + 1}/{cfg.train.max_epochs}".center(columns))
+
+        train(model, train_dataloader, optimizer, fabric, epoch, cfg)
+
+        if cfg.is_val:
+            fabric.print("Evaluate")
+            # instantiate(cfg.evaluate, model, val_dataloader, fabric=fabric)
+
+        if cfg.test:
+            pass
+            # for dataset in cfg.test:
+            #     columns = shutil.get_terminal_size().columns
+            #     fabric.print("-" * columns)
+            #     fabric.print(f"Testing on {cfg.test[dataset].dataname}".center(columns))
+            #
+            #     data = instantiate(cfg.test[dataset])
+            #     test_loader = fabric.setup_dataloaders(data.test_dataloader())
+            #
+            #     test = instantiate(cfg.test[dataset].test)
+            #     test(model, test_loader, fabric=fabric)
+
+        state = {
+            "epoch": epoch,
+            "model": model,
+            "optimizer": optimizer,
+            "scheduler": scheduler,
+        }
+        if cfg.trainer.save_ckpt == "all":
+            fabric.save(f"ckpt_{epoch}.ckpt", state)
+        elif cfg.trainer.save_ckpt == "last":
+            fabric.save("ckpt_last.ckpt", state)
+
+        fabric.barrier()
+
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    fabric.print(f"Training time {total_time_str}")
+
+    # for dataset in cfg.test:
+    #     columns = shutil.get_terminal_size().columns
+    #     fabric.print("-" * columns)
+    #     fabric.print(f"Testing on {cfg.test[dataset].dataname}".center(columns))
+    #
+    #     data = instantiate(cfg.test[dataset])
+    #     test_loader = fabric.setup_dataloaders(data.test_dataloader())
+    #
+    #     test = instantiate(cfg.test[dataset].test)
+    #     test(model, test_loader, fabric=fabric)
+
+    fabric.logger.finalize("success")
+    fabric.print(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+
+def train(model, train_loader, optimizer, fabric, epoch, cfg):
+    model.train()
+
+    if fabric.is_global_zero:
+        pbar = tqdm(
+            total=len(train_loader),
+            desc=f"Epoch {epoch}",
+            dynamic_ncols=True,
+            position=0
+        )
+    else:
+        pbar = None
+
+    for batch_idx, batch in enumerate(train_loader):
+        optimizer.zero_grad()
+        loss = model.training_step(batch, batch_idx, fabric)
+        fabric.backward(loss)
+        optimizer.step()
+
+        if pbar is not None:
+            pbar.set_postfix({
+                "loss": f"{loss.item():.6f}",
+                "lr": f"{optimizer.param_groups[0]['lr']:.6f}"
+            })
+            pbar.update(1)
+
+        if batch_idx % cfg.log.log_interval == 0:
+            fabric.log_dict({
+                "loss": loss.item(),
+                "lr": optimizer.param_groups[0]["lr"],
+                "epoch": epoch,
+            })
+
+    if pbar is not None:
+        pbar.close()
+
+if __name__ == "__main__":
+    main()

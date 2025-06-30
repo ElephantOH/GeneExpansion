@@ -1,0 +1,6 @@
+_target_: src.tool.scheduler.CosineSchedule
+
+init_lr: ${optimizer.lr}
+min_lr: 0
+decay_rate: ${optimizer.weight_decay}
+max_epochs: ${train.max_epochs}
