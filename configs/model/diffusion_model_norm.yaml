@@ -1,4 +1,4 @@
-model_name: diffusion_model_large
+model_name: diffusion_model_norm
 
 
 _target_: src.model.diffusion_model.DiffusionModel
@@ -12,17 +12,15 @@ model_config:
   train_text_encoder: False
   cross_attention_dim: 768
   layers_per_block: 2
-  block_out_channels: [ 128, 256, 384, 512 ]
+  block_out_channels: [ 64, 128, 256 ]
   ddpm_timesteps: 1000
-  ddim_timesteps: 50
-  resample_times: 5
+  ddim_timesteps: 20
+  resample_times: 1
   down_block_types:
     - "DownBlock2D"
     - "CrossAttnDownBlock2D"
     - "CrossAttnDownBlock2D"
-    - "CrossAttnDownBlock2D"
   up_block_types:
-    - "CrossAttnUpBlock2D"
     - "CrossAttnUpBlock2D"
     - "CrossAttnUpBlock2D"
     - "UpBlock2D"
@@ -31,7 +29,3 @@ model_config:
 
   loss:
     gene_corr_weight: 0.3
-
-  optim:
-    lr: 1e-4
-    weight_decay: 1e-5

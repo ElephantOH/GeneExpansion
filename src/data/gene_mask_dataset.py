@@ -210,8 +210,8 @@ class GeneMaskDataset(Dataset):
         gene_matrix = (gene_matrix - resize_value) / resize_value
 
         # 生成随机掩码 (0=缺失, 1=已知)
-        gene_mask = torch.ones_like(gene_matrix)
-        # gene_mask[:, int(gene_mask.shape[1] * (1 - self.mask_ratio)):] = 0  # 模拟底部区域的缺失
+        mask_prob = 0.33  # 每个元素为 1 的概率
+        gene_mask = torch.bernoulli(torch.full_like(gene_matrix, mask_prob))
 
         # 提取文本描述
         cell_type = self.adata.obs.iloc[idx]["cell_type"]

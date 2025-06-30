@@ -1,13 +1,16 @@
+import os
+
 import torch
+import torchvision
 from omegaconf import DictConfig
 from pytorch_lightning import LightningModule
-from diffusers import UNet2DConditionModel, DDPMScheduler
+from diffusers import UNet2DConditionModel, DDPMScheduler, DDIMScheduler
 from transformers import BertModel
 import torch.nn.functional as F
 from einops import rearrange
 
 class DiffusionModel(LightningModule):
-    def __init__(self, model_config: DictConfig):
+    def __init__(self, model_config: DictConfig, **kwargs):
         super().__init__()
 
         self.config = model_config
@@ -34,16 +37,24 @@ class DiffusionModel(LightningModule):
         )
 
         # 噪声调度器
-        self.noise_scheduler = DDPMScheduler(
-            num_train_timesteps=1000,
+        self.ddpm_scheduler = DDPMScheduler(
+            num_train_timesteps=self.config.ddpm_timesteps,
             beta_schedule="linear",
             prediction_type="epsilon"
+        )
+
+        self.ddim_scheduler = DDIMScheduler(
+            num_train_timesteps=self.config.ddpm_timesteps,
+            beta_schedule="linear",
+            prediction_type="epsilon",
+            clip_sample=False,  # 禁用值裁剪
+            set_alpha_to_one=False
         )
 
         # 自定义损失权重
         self.gene_corr_loss_weight = self.config.loss.gene_corr_weight
 
-    def unconditional_forward(self, noisy_genes, timesteps, text_emb, text_mask):
+    def unmask_forward(self, noisy_genes, timesteps, text_emb, text_mask):
         # U-Net前向传播 (文本条件)
         return self.unet(
             noisy_genes,
@@ -55,7 +66,6 @@ class DiffusionModel(LightningModule):
     def training_step(self, batch, batch_idx, fabric=None):
         # 准备数据
         clean_genes = batch["gene_matrix"]
-        mask = batch["gene_mask"]
 
         # 提取文本特征
         text_outputs = self.text_encoder(
@@ -66,11 +76,11 @@ class DiffusionModel(LightningModule):
 
         # 添加噪声
         noise = torch.randn_like(clean_genes)
-        timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (clean_genes.shape[0],), device=self.device)
-        noisy_genes = self.noise_scheduler.add_noise(clean_genes, noise, timesteps)
+        timesteps = torch.randint(0, self.ddpm_scheduler.config.num_train_timesteps, (clean_genes.shape[0],), device=self.device)
+        noisy_genes = self.ddpm_scheduler.add_noise(clean_genes, noise, timesteps)
 
         # 模型预测
-        pred_noise = self.unconditional_forward(noisy_genes, timesteps, text_emb, batch["text_attention_mask"])
+        pred_noise = self.unmask_forward(noisy_genes, timesteps, text_emb, batch["text_attention_mask"])
 
         # 基础MSE损失
         mse_loss = F.mse_loss(pred_noise, noise)
@@ -115,97 +125,176 @@ class DiffusionModel(LightningModule):
         )
         return (kl1 + kl2) / 2
 
-    def validation_step(self, batch, batch_idx):
-        # 验证阶段使用完整推理流程
-        filled_genes = self.repaint_inference(
+    def validation_step(self, batch, batch_idx, fabric):
+        # 使用RePaint推理
+        filled_genes = self.repaint_ddim_inference(
             batch["gene_matrix"],
-            batch["mask"],
+            batch["gene_mask"],
             batch["text_input_ids"],
-            batch["text_attention_mask"],
-            resample_steps=[900, 800, 700, 600, 500]
+            batch["text_attention_mask"]
         )
 
         # 仅计算masked区域的精度
         mse = F.mse_loss(
-            filled_genes[batch["mask"] < 0.5],
-            batch["gene_matrix"][batch["mask"] < 0.5]
+            filled_genes[batch["gene_mask"] < 0.5],
+            batch["gene_matrix"][batch["gene_mask"] < 0.5]
         )
-        self.log("val/mse", mse, prog_bar=True)
+        fabric.print(f"val_MSE: {mse}")
 
-        # 采样保存用于可视化
-        if batch_idx == 0:
-            self.logger.experiment.add_image(
-                "Original",
-                batch["gene_matrix"][0].squeeze(),
-                dataformats="HW"
-            )
-            self.logger.experiment.add_image(
-                "Masked",
-                (batch["gene_matrix"] * batch["mask"])[0].squeeze(),
-                dataformats="HW"
-            )
-            self.logger.experiment.add_image(
-                "Filled",
-                filled_genes[0].squeeze(),
-                dataformats="HW"
-            )
+        # 可视化 - 保存对比图像到/tmp
+        self.save_visualization(
+            batch["gene_matrix"],
+            batch["gene_mask"],
+            filled_genes,
+            batch_idx
+        )
 
-    def repaint_inference(self, original, mask, text_ids, text_attn, resample_steps):
-        """RePaint风格推理流程"""
-        device = self.device
-        self.to(device)
+        return mse
+
+    def save_visualization(self, original, mask, filled, batch_idx):
+        """保存对比图像：原始图像、mask后图像、修复结果"""
+        # 确保目录存在
+        os.makedirs("visual", exist_ok=True)
+
+        # 获取batch中的第一个样本
+        idx = 0
+        orig_img = original[idx].squeeze().cpu()
+        masked_img = (original * mask)[idx].squeeze().cpu()
+        filled_img = filled[idx].squeeze().cpu()
+
+        # 归一化到[0,1]范围
+        def normalize(x):
+            return (x - x.min()) / (x.max() - x.min() + 1e-8)
+
+        orig_img = normalize(orig_img)
+        masked_img = normalize(masked_img)
+        filled_img = normalize(filled_img)
+
+        # 水平拼接三个图像
+        combined = torch.cat([orig_img, masked_img, filled_img], dim=1)
+
+        # 添加通道维度 (1, H, W)
+        combined = combined.unsqueeze(0)
+
+        # 保存图像
+        filename = f"visual/{self.current_epoch}_{batch_idx}.png"
+        torchvision.utils.save_image(combined, filename)
+        print(f"Saved visualization to {filename}")
+
+
+    def repaint_ddim_inference(self, original, mask, text_ids, text_attn, resample_steps=None):
+        device = original.device
         self.eval()
 
-        # 文本编码
+        # 1. 配置DDIM调度器
+        scheduler = self.ddim_scheduler
+        scheduler.set_timesteps(self.config.ddim_timesteps)
+        timesteps = scheduler.timesteps
+        jump_length = self.config.ddpm_timesteps // self.config.ddim_timesteps  # 计算跳步长度
+
+        # 2. 文本编码
         text_outputs = self.text_encoder(
             input_ids=text_ids.to(device),
             attention_mask=text_attn.to(device)
         )
         text_emb = text_outputs.last_hidden_state
-
-        # 初始噪声
-        noisy_genes = torch.randn_like(original).to(device)
-
-        # 复制原始数据
-        current = original.clone().to(device)
         mask = mask.to(device)
+        original = original.to(device)
 
-        # 扩散步长 (反向)
-        timesteps = list(reversed(range(len(self.noise_scheduler))))
+        # 3. 初始化噪声图像和独立噪声
+        x_t = torch.randn_like(original, device=device)
 
-        # RePaint推理循环
+        # 为所有时间步预生成独立噪声 (DDPM和DDIM共享)
+        forward_noises = {
+            t.item(): torch.randn_like(original, device=device)
+            for t in self.ddpm_scheduler.timesteps
+        }
+        # 添加0时刻噪声（无噪声）
+        forward_noises[0] = torch.zeros_like(original, device=device)
+
+        # 4. 设置重采样步数
+        if resample_steps is None:
+            resample_steps = scheduler.timesteps[::4].cpu().numpy().tolist()
+        resample_steps = set(resample_steps)  # 转换为集合提高查找效率
+
+        # 5. 主循环
         for i, t in enumerate(timesteps):
-            # 为当前时间步创建张量
-            timestep = torch.tensor([t] * original.size(0), device=device)
-
-            # 模型预测噪声
+            # 5.1 DDIM正常去噪
             with torch.no_grad():
-                noise_pred = self.forward(
-                    noisy_genes,
-                    timestep,
-                    mask,
-                    text_emb,
-                    text_attn.to(device)
-                )
+                noise_pred = self.unet(
+                    x_t,
+                    t.reshape(1).to(device),
+                    encoder_hidden_states=text_emb,
+                    encoder_attention_mask=text_attn.to(device)
+                ).sample
 
-            # 更新噪声图像 (DDIM更新规则)
-            noisy_genes = self.noise_scheduler.step(
-                noise_pred, t, noisy_genes, eta=0.0
+            # 执行DDIM跳步
+            prev_t = max(t - jump_length, 0)  # 确保不越界
+            x_prev = scheduler.step(
+                noise_pred,
+                t,
+                x_t,
+                eta=0.0
             ).prev_sample
 
-            # RePaint重采样步骤
-            if t in resample_steps:
-                # 在mask区域重新注入噪声
-                noise = torch.randn_like(noisy_genes)
-                noisy_genes = torch.where(
-                    mask > 0.5,
-                    noisy_genes,  # 保持已知区域
-                    self.noise_scheduler.add_noise(
-                        original.to(device),
-                        noise,
-                        torch.tensor([t], device=device)
-                    )  # 对mask区域重新噪声化
-                )
+            # 5.2 Repaint区域替换
+            # 计算prev_t时刻的加噪真实图像
+            noisy_original_prev = self._get_noisy_image(original, prev_t)
+            x_prev = mask * noisy_original_prev + (1 - mask) * x_prev
 
-        # 返回最终预测
-        return noisy_genes.detach().cpu()
+            # 5.3 重采样检测
+            if prev_t in resample_steps and prev_t > 0:
+                for _ in range(self.resample_times):
+                    # 5.3.1 DDPM加噪回退
+                    x_next = self._ddpm_add_noise(x_prev, prev_t, prev_t + 1)
+
+                    # 5.3.2 DDPM正常去噪
+                    with torch.no_grad():
+                        noise_pred_next = self.unet(
+                            x_next,
+                            torch.tensor([prev_t + 1], device=device),
+                            encoder_hidden_states=text_emb,
+                            encoder_attention_mask=text_attn.to(device)
+                        ).sample
+
+                    # 执行DDPM去噪
+                    x_prev_denoised = self.ddpm_scheduler.step(
+                        noise_pred_next,
+                        prev_t + 1,
+                        x_next
+                    ).prev_sample
+
+                    # 5.3.3 Repaint区域替换
+                    noisy_original_prev = self._get_noisy_image(original, prev_t)
+                    x_prev_denoised = mask * noisy_original_prev + (1 - mask) * x_prev_denoised
+
+                    # 更新为去噪后图像
+                    x_prev = x_prev_denoised
+
+            # 更新当前图像
+            x_t = x_prev
+
+        return x_t
+
+    def _get_noisy_image(self, original, t):
+        """获取指定时间步的加噪真实图像"""
+        noise = torch.randn_like(original, device=original.device)
+        alpha_prod_t = self.ddpm_scheduler.alphas_cumprod[t]
+        sqrt_alpha_prod = torch.sqrt(alpha_prod_t)
+        sqrt_one_minus_alpha_prod = torch.sqrt(1 - alpha_prod_t)
+
+        return sqrt_alpha_prod * original + sqrt_one_minus_alpha_prod * noise
+
+    def _ddpm_add_noise(self, x_prev, t_current, t_next):
+        """执行DDPM加噪回退"""
+        # 计算噪声系数
+        noise = torch.randn_like(x_prev, device=x_prev.device)
+        alpha_prod_t = self.ddpm_scheduler.alphas_cumprod[t_current]
+        alpha_prod_t_next = self.ddpm_scheduler.alphas_cumprod[t_next]
+
+        # 计算加噪系数
+        coef1 = torch.sqrt(alpha_prod_t_next / alpha_prod_t)
+        coef2 = torch.sqrt(1 - alpha_prod_t_next / alpha_prod_t)
+
+        # 应用加噪公式
+        return coef1 * x_prev + coef2 * noise

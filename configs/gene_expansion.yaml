@@ -1,4 +1,10 @@
 
+hydra:
+  run:
+    dir: outputs/${data.data_name}/${model.model_name}
+  job: # automatically go to the job folder (needed for hydra > 1.2 with new behavior)
+    chdir: true
+
 defaults:
   - _self_
   - data: test
@@ -14,6 +20,4 @@ train:
 is_val: True
 
 log:
-  log_interval: 30
-  project: "GeneDiffusion"
-  dir: "logs/geneset_expansion"
+  log_interval: 100
