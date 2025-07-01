@@ -89,6 +89,11 @@ def main(cfg: DictConfig):
             fabric.load(checkpoint_path, state)
             start_epoch = resume_epoch + 1
             fabric.print(f"✅ 成功加载检查点，将从 epoch {start_epoch} 继续训练")
+
+            if cfg.is_val:
+                fabric.print("Start Validation!")
+                val(model, val_dataloader, fabric)
+
         except FileNotFoundError:
             fabric.print(f"⚠️ 检查点 {checkpoint_path} 未找到，从头开始训练")
         except Exception as e:
