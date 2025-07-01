@@ -206,7 +206,7 @@ class DiffusionModel(LightningModule):
 
         # 保存图像
         filename = f"visual/{stage}_{self.current_epoch}_{batch_idx}.png"
-        torchvision.utils.save_image(combined, filename)
+        torchvision.utils.save_image(combined.cpu().float(), filename)
         print(f"Saved Visualization to {filename}")
 
     def unmask_ddim_inference(self, fabric, original, text_ids, text_attn):
