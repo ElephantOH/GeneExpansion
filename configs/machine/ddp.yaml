@@ -1,0 +1,17 @@
+defaults:
+  - default.yaml
+
+strategy: ddp
+
+accelerator: gpu
+devices: 1
+num_nodes: 2
+
+dist:
+  master_addr: ${oc.env:MASTER_ADDR,10.16.5.195}
+  master_port: ${oc.env:MASTER_PORT,29500}
+  node_rank: ${oc.env:NODE_RANK,1}
+
+fabric:
+  num_nodes: ${trainer.num_nodes}
+  strategy: ${trainer.strategy}

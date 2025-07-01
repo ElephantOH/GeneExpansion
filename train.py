@@ -69,24 +69,47 @@ def main(cfg: DictConfig):
 
     scheduler = instantiate(cfg.scheduler)
 
-    fabric.print("Start training")
+    # =============== 断点续训逻辑 ===============
+    start_epoch = 0
+    # 如果需要恢复训练
+    if cfg.train.resume:
+        resume_epoch = cfg.train.resume_epoch
+        checkpoint_path = f"epoch_{resume_epoch}.ckpt"
+        fabric.print(f"⏩ 恢复训练: 加载 {checkpoint_path} (epoch {resume_epoch})")
+
+        # 创建完整状态字典并加载
+        state = {
+            "model": model,
+            "optimizer": optimizer,
+            "scheduler": scheduler,
+        }
+
+        try:
+            # 加载检查点
+            fabric.load(checkpoint_path, state)
+            start_epoch = resume_epoch + 1
+            fabric.print(f"✅ 成功加载检查点，将从 epoch {start_epoch} 继续训练")
+        except FileNotFoundError:
+            fabric.print(f"⚠️ 检查点 {checkpoint_path} 未找到，从头开始训练")
+        except Exception as e:
+            fabric.print(f"❌ 加载检查点时出错: {str(e)}")
+            fabric.print("⚠️ 回退到从头开始训练")
+    # =========================================
+
+    fabric.print(f"🚀 开始训练 (从 epoch {start_epoch} 到 {cfg.train.max_epochs - 1})")
     start_time = time.time()
 
-    for epoch in range(cfg.train.max_epochs):
+    columns = shutil.get_terminal_size().columns
+    fabric.print("-" * columns)
+    fabric.print(cfg)
+
+    for epoch in range(start_epoch, cfg.train.max_epochs):
         scheduler(optimizer, epoch)
 
-        columns = shutil.get_terminal_size().columns
         fabric.print("-" * columns)
         fabric.print(f"Epoch {epoch + 1}/{cfg.train.max_epochs}".center(columns))
 
         train(model, train_dataloader, optimizer, fabric, epoch, cfg, file_logger)
-
-        if cfg.is_val:
-            fabric.print("Val...")
-            val(model, val_dataloader, fabric)
-
-        if cfg.test:
-            pass
 
         state = {
             "epoch": epoch,
@@ -94,12 +117,14 @@ def main(cfg: DictConfig):
             "optimizer": optimizer,
             "scheduler": scheduler,
         }
-        if cfg.trainer.save_ckpt == "all":
-            fabric.save(f"ckpt_{epoch}.ckpt", state)
-        elif cfg.trainer.save_ckpt == "last":
-            fabric.save("ckpt_last.ckpt", state)
+
+        fabric.save(f"epoch_{epoch}.ckpt", state)
 
         fabric.barrier()
+
+        if cfg.is_val:
+            fabric.print("Start Validation!")
+            val(model, val_dataloader, fabric)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -123,6 +148,7 @@ def train(model, train_loader, optimizer, fabric, epoch, cfg, file_logger=None):
         pbar = None
 
     for batch_idx, batch in enumerate(train_loader):
+
         optimizer.zero_grad()
         loss = model.training_step(batch, batch_idx, fabric)
         fabric.backward(loss)
@@ -155,6 +181,8 @@ def train(model, train_loader, optimizer, fabric, epoch, cfg, file_logger=None):
 
 def val(model, val_loader, fabric):
     model.eval()
+    total_metrics = {}
+    count = 0
     if fabric.is_global_zero:
         pbar = tqdm(
             total=len(val_loader),
@@ -166,15 +194,21 @@ def val(model, val_loader, fabric):
         pbar = None
 
     for batch_idx, batch in enumerate(val_loader):
-        if batch_idx > 20:
+        if batch_idx >= 3:
             break
-        mse = model.validation_step(batch, batch_idx, fabric)
-        if pbar is not None:
-            pbar.set_postfix({
-                "mse": f"{mse:.2f}",
-            })
-            pbar.update(1)
 
+        metrics = model.validation_step(batch, batch_idx, fabric, stage="val", solver="repaint_ddim")
+
+        # 累积指标
+        for k, v in metrics.items():
+            if k not in total_metrics:
+                total_metrics[k] = 0.0
+            total_metrics[k] += v
+
+        count += 1
+        if pbar is not None:
+            pbar.set_postfix({k: f"{v:.2f}" for k, v in metrics.items()})
+            pbar.update(1)
 
     if pbar is not None:
         pbar.close()

@@ -1,20 +1,13 @@
 import os
-import hydra
 import torch
 import scanpy as sc
 import pandas as pd
 from scipy import sparse
 import numpy as np
-from omegaconf import DictConfig, OmegaConf
-import pytorch_lightning as pl
-from pytorch_lightning import seed_everything
 from pytorch_lightning import LightningDataModule
-from lightning_fabric.fabric import Fabric
-from diffusers import UNet2DConditionModel, DDPMScheduler, DDIMScheduler
-from transformers import BertModel, BertTokenizer
+from transformers import BertTokenizer
 from torch.utils.data import Dataset, DataLoader
-from hydra.utils import instantiate
-import torch.nn.functional as F
+
 from einops import rearrange
 
 def fix_file(file_path):
@@ -226,6 +219,7 @@ class GeneMaskDataset(Dataset):
             truncation=True,
             return_tensors="pt"
         )
+
         return_dict = {
             "gene_matrix": gene_matrix,
             "gene_mask": gene_mask,
@@ -234,5 +228,6 @@ class GeneMaskDataset(Dataset):
             "text_attention_mask": text_input.attention_mask.squeeze(0),
             "text_desc": text_desc
         }
+
 
         return return_dict

@@ -9,13 +9,21 @@ defaults:
   - _self_
   - data: test
   - machine: gpu
-  - model: diffusion_model_large
+  - model: diffusion_model_norm
   - optimizer: adamw
   - scheduler: cosine
 
 train:
   seed: 42
   max_epochs: 40
+  resume: True
+  resume_epoch: 0
+
+test:
+  seed: 42
+  epoch: 0
+  solver: repaint_ddim
+
 
 is_val: True
 

@@ -14,8 +14,8 @@ model_config:
   layers_per_block: 2
   block_out_channels: [ 128, 256, 384, 512 ]
   ddpm_timesteps: 1000
-  ddim_timesteps: 50
-  resample_times: 5
+  ddim_timesteps: 20
+  resample_times: 3
   down_block_types:
     - "DownBlock2D"
     - "CrossAttnDownBlock2D"

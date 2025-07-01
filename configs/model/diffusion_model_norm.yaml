@@ -12,11 +12,12 @@ model_config:
   train_text_encoder: False
   cross_attention_dim: 768
   layers_per_block: 2
-  block_out_channels: [ 64, 128, 256 ]
+  block_out_channels: [ 64, 128, 256, 512 ]
   ddpm_timesteps: 1000
-  ddim_timesteps: 20
+  ddim_timesteps: 50
   resample_times: 1
   down_block_types:
+    - "DownBlock2D"
     - "DownBlock2D"
     - "CrossAttnDownBlock2D"
     - "CrossAttnDownBlock2D"
@@ -24,8 +25,10 @@ model_config:
     - "CrossAttnUpBlock2D"
     - "CrossAttnUpBlock2D"
     - "UpBlock2D"
+    - "UpBlock2D"
   norm_num_groups: 32
   time_embedding_type: "positional"
+  use_gradient_checkpointing: True
 
   loss:
     gene_corr_weight: 0.3
