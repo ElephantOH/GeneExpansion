@@ -90,16 +90,16 @@ def main(cfg: DictConfig):
             start_epoch = resume_epoch + 1
             fabric.print(f"✅ 成功加载检查点，将从 epoch {start_epoch} 继续训练")
 
-            if cfg.is_val:
-                fabric.print("Start Validation!")
-                val(model, val_dataloader, fabric)
-
         except FileNotFoundError:
             fabric.print(f"⚠️ 检查点 {checkpoint_path} 未找到，从头开始训练")
         except Exception as e:
             fabric.print(f"❌ 加载检查点时出错: {str(e)}")
             fabric.print("⚠️ 回退到从头开始训练")
     # =========================================
+
+    if cfg.is_val:
+        fabric.print("Start Validation!")
+        val(model, val_dataloader, fabric)
 
     fabric.print(f"🚀 开始训练 (从 epoch {start_epoch} 到 {cfg.train.max_epochs - 1})")
     start_time = time.time()
@@ -161,8 +161,8 @@ def train(model, train_loader, optimizer, fabric, epoch, cfg, file_logger=None):
 
         if pbar is not None:
             pbar.set_postfix({
-                "loss": f"{loss.item():.6f}",
-                "lr": f"{optimizer.param_groups[0]['lr']:.6f}"
+                "loss": f"{loss.item():.10f}",
+                "lr": f"{optimizer.param_groups[0]['lr']:.10f}"
             })
             pbar.update(1)
 
@@ -184,6 +184,7 @@ def train(model, train_loader, optimizer, fabric, epoch, cfg, file_logger=None):
     if pbar is not None:
         pbar.close()
 
+
 def val(model, val_loader, fabric):
     model.eval()
     total_metrics = {}
@@ -199,7 +200,7 @@ def val(model, val_loader, fabric):
         pbar = None
 
     for batch_idx, batch in enumerate(val_loader):
-        if batch_idx >= 3:
+        if batch_idx >= 1:
             break
 
         metrics = model.validation_step(batch, batch_idx, fabric, stage="val", solver="repaint_ddim")
@@ -212,7 +213,7 @@ def val(model, val_loader, fabric):
 
         count += 1
         if pbar is not None:
-            pbar.set_postfix({k: f"{v:.2f}" for k, v in metrics.items()})
+            pbar.set_postfix({k: f"{v:.6f}" for k, v in metrics.items()})
             pbar.update(1)
 
     if pbar is not None:

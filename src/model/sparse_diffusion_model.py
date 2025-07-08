@@ -1,7 +1,6 @@
 import os
 
 import numpy as np
-import pandas as pd
 import torch
 import torchvision
 from omegaconf import DictConfig
@@ -9,12 +8,11 @@ from pytorch_lightning import LightningModule
 from diffusers import UNet2DConditionModel, DDPMScheduler, DDIMScheduler, DPMSolverMultistepScheduler
 from transformers import BertModel
 import torch.nn.functional as F
-from torchmetrics.functional.image import structural_similarity_index_measure as ssim
+from sklearn.decomposition import DictionaryLearning
+from scipy import sparse
 
-from src.tool.save_inference import flatten_expression_batch, save_to_single_file
 
-
-class DiffusionModel(LightningModule):
+class SparseDiffusionModel(LightningModule):
     def __init__(self, model_config: DictConfig, **kwargs):
         super().__init__()
 
@@ -44,8 +42,6 @@ class DiffusionModel(LightningModule):
         if self.config.use_gradient_checkpointing:
             self.unet.enable_gradient_checkpointing()
 
-        self.scheduler = None
-
         # 噪声调度器
         self.ddpm_scheduler = DDPMScheduler(
             num_train_timesteps=self.config.ddpm_timesteps,
@@ -61,7 +57,7 @@ class DiffusionModel(LightningModule):
             set_alpha_to_one=False
         )
 
-        self.dpm_scheduler = DPMSolverMultistepScheduler(
+        self.dpm_solver = DPMSolverMultistepScheduler(
             num_train_timesteps=self.config.ddpm_timesteps,
             beta_schedule="linear",
             algorithm_type="dpmsolver++",  # 最佳算法
@@ -70,205 +66,8 @@ class DiffusionModel(LightningModule):
             thresholding=False
         )
 
-        self.map_csv = pd.read_csv(self.config.map_path)
-        self.result_path = self.config.result_path
+    def sparse_ddim_inference(self, fabric, original, mask, text_ids, text_attn, resample_steps=None):
 
-    def unmask_forward(self, noisy_genes, timesteps, text_emb, text_mask):
-        # U-Net前向传播 (文本条件)
-        return self.unet(
-            noisy_genes,
-            timesteps,
-            encoder_hidden_states=text_emb,
-            encoder_attention_mask=text_mask
-        ).sample
-
-    def training_step(self, batch, batch_idx, fabric):
-        genes = fabric.to_device(batch["gene_matrix"])
-        input_ids = fabric.to_device(batch["text_input_ids"])
-        attention_mask = fabric.to_device(batch["text_attention_mask"])
-
-        text_outputs = self.text_encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
-        text_emb = text_outputs.last_hidden_state
-
-        noise = torch.randn_like(genes)
-
-        # 时间步
-        timesteps = torch.randint(
-            0,
-            self.ddpm_scheduler.config.num_train_timesteps,
-            (genes.shape[0],),
-            device=fabric.device  # 使用fabric.device
-        )
-
-        # 添加噪声（scheduler会自动处理设备）
-        noisy_genes = self.ddpm_scheduler.add_noise(genes, noise, timesteps)
-
-        # 模型预测
-        pred_noise = self.unmask_forward(noisy_genes, timesteps, text_emb, attention_mask)
-
-        # 损失计算
-        return F.mse_loss(pred_noise, noise)
-
-    def validation_step(self, batch, batch_idx, fabric, stage="test", solver="repaint_ddim"):
-        # 使用RePaint推理
-        if solver == "repaint_ddim":
-            filled_genes = self.repaint_ddim_inference(
-                fabric,
-                batch["gene_matrix"],
-                batch["gene_mask"],
-                batch["text_input_ids"],
-                batch["text_attention_mask"]
-            )
-        elif solver == "unmask_ddim":
-            filled_genes = self.unmask_ddim_inference(
-                fabric,
-                batch["gene_matrix"],
-                batch["text_input_ids"],
-                batch["text_attention_mask"]
-            )
-
-        # 仅计算masked区域的精度
-        total_mse = 0.0
-        total_pcc = 0.0
-        total_cossim = 0.0
-        for i in range(batch["gene_matrix"].shape[0]):
-            # 获取masked区域的数据
-            mask = batch["gene_mask"][i] < 0.5
-            pred = filled_genes[i][mask].view(-1)
-            target = batch["gene_matrix"][i][mask].view(-1)
-
-            # 计算MSE
-            mse = F.mse_loss(pred, target).item()
-            total_mse += mse
-
-            # 计算皮尔逊相关系数(PCC)
-            if pred.nelement() > 1:  # 避免当masked区域过小时的计算错误
-                std_pred, std_target = torch.std(pred), torch.std(target)
-                if std_pred > 1e-8 and std_target > 1e-8:
-                    cov = torch.mean((pred - torch.mean(pred)) * (target - torch.mean(target)))
-                    pcc = cov / (std_pred * std_target)
-                    total_pcc += pcc.item()
-
-            # 计算余弦相似度(COSSIM)
-            # 确保向量非零
-            if torch.norm(pred) > 1e-8 and torch.norm(target) > 1e-8:
-                pred_normalized = pred / torch.norm(pred)
-                target_normalized = target / torch.norm(target)
-                cossim = torch.dot(pred_normalized, target_normalized).item()
-                total_cossim += cossim
-
-        # 取批次平均值
-        count = batch["gene_matrix"].shape[0]
-        total_mse /= count
-        total_pcc /= count
-        total_cossim /= count
-
-        # 计算整个图像的SSIM
-        total_ssim = 0.0
-        for i in range(batch["gene_matrix"].shape[0]):
-            img1 = filled_genes[i:i + 1]  # 保持[b, 1, 180, 180]维度
-            img2 = batch["gene_matrix"][i:i + 1]
-
-            # 动态计算图像数据范围
-            min_val = min(torch.min(img1).item(), torch.min(img2).item())
-            max_val = max(torch.max(img1).item(), torch.max(img2).item())
-            data_range = max_val - min_val
-
-            # 处理常数图像的情况
-            if data_range < 1e-6:
-                data_range = 1.0  # 避免除零错误
-
-            ssim_val = ssim(img1, img2, data_range=data_range)
-            total_ssim += ssim_val.item()
-        total_ssim /= batch["gene_matrix"].shape[0]
-
-        # 可视化 - 保存对比图像到/tmp
-        if batch_idx == 0:
-            self.save_visualization(
-                batch["gene_matrix"],
-                batch["gene_mask"],
-                filled_genes,
-                batch_idx,
-                stage
-            )
-
-        indices = batch['indices']  # 获取批次中每个样本的全局索引
-        filled_genes_gathered = fabric.all_gather(filled_genes)  # [所有GPU, B, C, H, W]
-        indices_gathered = fabric.all_gather(indices)  # [所有GPU, B]
-
-        if fabric.global_rank == 0:
-            # 展平多GPU收集的结果
-            filled_genes_flat = filled_genes_gathered.flatten(start_dim=0, end_dim=1)
-            indices_flat = indices_gathered.flatten()
-
-            # 按原始索引排序
-            sorted_indices = torch.argsort(indices_flat)
-            sorted_genes = filled_genes_flat[sorted_indices]
-
-            # 保存排序后的结果
-            self.save_results(sorted_genes)
-
-        return {
-            "mse": total_mse,
-            "pcc": total_pcc,
-            "cossim": total_cossim,
-            "ssim": total_ssim,
-        }
-
-    def save_visualization(self, original, mask, filled, batch_idx, stage="test"):
-
-        os.makedirs(f"visual/{stage}", exist_ok=True)
-
-        # 获取batch中的第一个样本
-        idx = 0
-        orig_img = original[idx].squeeze().cpu()
-        masked_img = (original * mask)[idx].squeeze().cpu()
-        filled_img = filled[idx].squeeze().cpu()
-
-        # 归一化到[0,1]范围
-        def normalize(x):
-            return (x - x.min()) / (x.max() - x.min() + 1e-8)
-
-        orig_img = normalize(orig_img)
-        masked_img = normalize(masked_img)
-        filled_img = normalize(filled_img)
-
-        # 水平拼接三个图像
-        combined = torch.cat([orig_img, masked_img, filled_img], dim=1)
-
-        # 添加通道维度 (1, H, W)
-        combined = combined.unsqueeze(0)
-
-        # 保存图像
-        filename = f"visual/{stage}/{self.epoch}_{batch_idx}.png"
-        self.epoch = self.epoch + 1
-        torchvision.utils.save_image(combined.cpu().float(), filename)
-        print(f"Saved Visualization to {filename}")
-
-
-    def save_results(self, gene_matrix, id=0):
-        # input [b, 1, 180, 180]
-        os.makedirs(self.result_path, exist_ok=True)
-        gene_matrix = gene_matrix.squeeze(1).cpu().numpy().astype(np.float32)
-        flat_batch = flatten_expression_batch(gene_matrix, self.map_csv)
-        file_name = f"cell_{self.config.test_data_name}_{self.config.solver_type}.npy"
-        save_to_single_file(flat_batch, file_path=os.path.join(self.result_path, file_name))
-        print(f"✓已将 {gene_matrix.shape[0]} 个 batch 追加到 '{file_name}'")
-
-
-    def repaint_ddim_inference(self, fabric, original, mask, text_ids, text_attn, resample_steps=None):
-        """
-        DDIM采样过程 - 适配Fabric多GPU环境
-
-        参数：
-        fabric: Fabric实例
-        original: 参考输入 (仅用于形状，需由fabric.to_device处理)
-        text_ids: 文本token ID (需由fabric.to_device处理)
-        text_attn: 文本注意力掩码 (需由fabric.to_device处理)
-        """
         # 确保使用fabric的设备
         device = fabric.device
 
@@ -328,48 +127,135 @@ class DiffusionModel(LightningModule):
                 )
                 x_prev = output.prev_sample
 
-                # x_prev = torch.clamp(x_prev, min=-1.0, max=1.0)
+                # 值裁剪确保在合理范围内
+                x_prev = torch.clamp(x_prev, min=-1.0, max=1.0)
 
                 noisy_original_prev = self._get_noisy_image(original, prev_t)
                 x_prev = mask * noisy_original_prev + (1 - mask) * x_prev
 
                 if prev_t in resample_steps and prev_t > 0:
-                    x_prev = self.resample(original, mask, x_prev, prev_t, text_emb, text_attn, device)
+                    self.resample(original, mask, x_prev, prev_t, text_emb, text_attn, device)
 
                 # 更新当前状态
                 x_t = x_prev
 
         return x_t
 
-    def resample(self, original, mask, x_prev, prev_t, text_emb, text_attn, device):
-        x_prev_denoised = x_prev
-        for _ in range(self.config.resample_times):
-            # 5.3.1 DDPM加噪回退
-            x_next = self._ddpm_add_noise(x_prev, prev_t, prev_t + 1)
+    def unmask_forward(self, noisy_genes, timesteps, text_emb, text_mask, sparse_codes=None):
+        # U-Net前向传播 (文本条件)
+        return self.unet(
+            noisy_genes,
+            timesteps,
+            encoder_hidden_states=text_emb,
+            encoder_attention_mask=text_mask
+        ).sample
 
-            # 5.3.2 DDPM正常去噪
-            with torch.no_grad():
-                noise_pred_next = self.unet(
-                    x_next,
-                    torch.tensor([prev_t + 1], device=device),
-                    encoder_hidden_states=text_emb,
-                    encoder_attention_mask=text_attn.to(device)
-                ).sample
+    def training_step(self, batch, batch_idx, fabric):
+        genes = fabric.to_device(batch["gene_matrix"])
+        input_ids = fabric.to_device(batch["text_input_ids"])
+        attention_mask = fabric.to_device(batch["text_attention_mask"])
 
-            # 执行DDPM去噪
-            x_prev_denoised = self.ddpm_scheduler.step(
-                noise_pred_next,
-                prev_t + 1,
-                x_next
-            ).prev_sample
+        text_outputs = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+        text_emb = text_outputs.last_hidden_state
 
-            # x_prev_denoised = torch.clamp(x_prev_denoised, min=-1.0, max=1.0)
+        noise = torch.randn_like(genes)
 
-            # 5.3.3 Repaint区域替换
-            noisy_original_prev = self._get_noisy_image(original, prev_t)
-            x_prev_denoised = mask * noisy_original_prev + (1 - mask) * x_prev_denoised
+        # 时间步
+        timesteps = torch.randint(
+            0,
+            self.ddpm_scheduler.config.num_train_timesteps,
+            (genes.shape[0],),
+            device=fabric.device  # 使用fabric.device
+        )
 
-        return x_prev_denoised
+        # 添加噪声（scheduler会自动处理设备）
+        noisy_genes = self.ddpm_scheduler.add_noise(genes, noise, timesteps)
+
+        # 模型预测
+        pred_noise = self.unmask_forward(noisy_genes, timesteps, text_emb, attention_mask)
+
+        # 重建损失
+        reconstruction_loss = F.mse_loss(pred_noise, noise)
+
+        # 总损失
+        total_loss = reconstruction_loss
+
+        return total_loss
+
+    def validation_step(self, batch, batch_idx, fabric, stage="test", solver="repaint_ddim"):
+        # 使用RePaint推理
+        if solver == "repaint_ddim":
+            filled_genes = self.repaint_ddim_inference(
+                fabric,
+                batch["gene_matrix"],
+                batch["gene_mask"],
+                batch["text_input_ids"],
+                batch["text_attention_mask"]
+            )
+        elif solver == "unmask_ddim":
+            filled_genes = self.unmask_ddim_inference(
+                fabric,
+                batch["gene_matrix"],
+                batch["text_input_ids"],
+                batch["text_attention_mask"]
+            )
+
+        # 仅计算masked区域的精度
+        total_mse = 0.0
+        for i in range(batch["gene_matrix"].shape[0]):
+            mse = F.mse_loss(
+                filled_genes[i][batch["gene_mask"][i] < 0.5],
+                batch["gene_matrix"][i][batch["gene_mask"][i] < 0.5]
+            ).item()
+            total_mse += mse
+        total_mse /= batch["gene_matrix"].shape[0]
+
+        # 可视化 - 保存对比图像到/tmp
+        self.save_visualization(
+            batch["gene_matrix"],
+            batch["gene_mask"],
+            filled_genes,
+            batch_idx,
+            stage
+        )
+
+        return {
+            "mse": total_mse
+        }
+
+    def save_visualization(self, original, mask, filled, batch_idx, stage="test"):
+        """保存对比图像：原始图像、mask后图像、修复结果"""
+        # 确保目录存在
+        os.makedirs("visual", exist_ok=True)
+
+        # 获取batch中的第一个样本
+        idx = 0
+        orig_img = original[idx].squeeze().cpu()
+        masked_img = (original * mask)[idx].squeeze().cpu()
+        filled_img = filled[idx].squeeze().cpu()
+
+        # 归一化到[0,1]范围
+        def normalize(x):
+            return (x - x.min()) / (x.max() - x.min() + 1e-8)
+
+        orig_img = normalize(orig_img)
+        masked_img = normalize(masked_img)
+        filled_img = normalize(filled_img)
+
+        # 水平拼接三个图像
+        combined = torch.cat([orig_img, masked_img, filled_img], dim=1)
+
+        # 添加通道维度 (1, H, W)
+        combined = combined.unsqueeze(0)
+
+        # 保存图像
+        filename = f"visual/{stage}_{self.epoch}_{batch_idx}.png"
+        self.epoch = self.epoch + 1
+        torchvision.utils.save_image(combined.cpu().float(), filename)
+        print(f"Saved Visualization to {filename}")
 
     def unmask_ddim_inference(self, fabric, original, text_ids, text_attn):
         """
@@ -435,12 +321,114 @@ class DiffusionModel(LightningModule):
                 x_prev = output.prev_sample
 
                 # 值裁剪确保在合理范围内
-                # x_prev = torch.clamp(x_prev, min=-1.0, max=1.0)
+                x_prev = torch.clamp(x_prev, min=-1.0, max=1.0)
 
                 # 更新当前状态
                 x_t = x_prev
 
         return x_t
+
+
+    def sparse_ddim_inference(self, fabric, original, mask, text_ids, text_attn):
+        """推理步骤：带稀疏引导的图像修复"""
+
+        # 文本编码
+        with torch.no_grad():
+            text_outputs = self.text_encoder(
+                input_ids=text_ids,
+                attention_mask=text_attn
+            )
+            text_emb = text_outputs.last_hidden_state
+
+        # 初始化修复区域
+        x = torch.randn_like(original)
+        x = original * mask + x * (1 - mask)  # 保留已知区域
+        x = torch.clamp(x, min=-1.0, max=1.0)
+
+        # 使用DDIM调度器加速推理
+        scheduler = DDIMScheduler(
+            num_train_timesteps=self.config.ddpm_timesteps,
+            beta_schedule="linear",
+            prediction_type="epsilon",
+            clip_sample=False
+        )
+        scheduler.set_timesteps(self.config.inference_steps)
+
+        with torch.no_grad():
+            for t in scheduler.timesteps:
+                # 1. 获取当前稀疏编码
+                sparse_codes = self.sparse_manager.sparse_encode(x)
+
+                # 2. UNet预测
+                model_output = self.unet(
+                    x,
+                    t.expand(x.shape[0]),
+                    text_emb,
+                    text_attn,
+                    sparse_codes
+                )
+
+                # 3. 调度器更新
+                x = scheduler.step(model_output, t, x).prev_sample
+
+                # 4. 应用掩码约束
+                x = original * mask + x * (1 - mask)
+                x = torch.clamp(x, min=-1.0, max=1.0)
+
+                # 5. 稀疏投影 (关键步骤)
+                if t > scheduler.timesteps[0]:  # 首步跳过
+                    with torch.no_grad():
+                        # 提取非背景区域
+                        non_bg_mask = (original != -1) | (mask == 0)
+
+                        # 稀疏重建
+                        for i, img in enumerate(x):
+                            # 只处理修复区域
+                            repair_mask = (mask[i] == 0) & non_bg_mask[i]
+                            if repair_mask.any():
+                                # 获取稀疏编码
+                                code = sparse_codes[i]
+
+                                # 稀疏重建 (D * s)
+                                reconstructed = torch.matmul(
+                                    torch.tensor(self.sparse_manager.dictionary, device=x.device),
+                                    code.T
+                                ).view(1, self.sparse_manager.patch_size, self.sparse_manager.patch_size)
+
+                                # 应用重建 (仅修复区域)
+                                x[i][repair_mask] = reconstructed[repair_mask]
+
+        return x
+
+
+    def resample(self, original, mask, x_prev, prev_t, text_emb, text_attn, device):
+        for _ in range(self.config.resample_times):
+            # 5.3.1 DDPM加噪回退
+            x_next = self._ddpm_add_noise(x_prev, prev_t, prev_t + 1)
+
+            # 5.3.2 DDPM正常去噪
+            with torch.no_grad():
+                noise_pred_next = self.unet(
+                    x_next,
+                    torch.tensor([prev_t + 1], device=device),
+                    encoder_hidden_states=text_emb,
+                    encoder_attention_mask=text_attn.to(device)
+                ).sample
+
+            # 执行DDPM去噪
+            x_prev_denoised = self.ddpm_scheduler.step(
+                noise_pred_next,
+                prev_t + 1,
+                x_next
+            ).prev_sample
+
+            x_prev_denoised = torch.clamp(x_prev_denoised, min=-1.0, max=1.0)
+
+            # 5.3.3 Repaint区域替换
+            noisy_original_prev = self._get_noisy_image(original, prev_t)
+            x_prev_denoised = mask * noisy_original_prev + (1 - mask) * x_prev_denoised
+
+            return x_prev_denoised
 
     def _get_noisy_image(self, original, t):
         """获取指定时间步的加噪真实图像"""

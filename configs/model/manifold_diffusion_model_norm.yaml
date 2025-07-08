@@ -1,6 +1,7 @@
-model_name: diffusion_model_norm
+model_name: manifold_diffusion_model_norm
 
-_target_: src.model.diffusion_model.DiffusionModel
+
+_target_: src.model.manifold_diffusion_model.ManifoldDiffusionModel
 model_config:
   max_epochs: ${train.max_epochs}
   sample_size: ${data.image_size}
@@ -14,11 +15,13 @@ model_config:
   block_out_channels: [ 64, 128, 256, 512 ]
   ddpm_timesteps: 1000
   ddim_timesteps: 50
+  dpm_timesteps: 50
   resample_times: 1
   map_path: ${data.map_paths.train}
   test_data_name: ${test.data_name}
   solver_type: ${test.solver}
   result_path: ${test.result_path}
+  manifold_path: ${machine.work_dir}/pretrain_model/ManifoldData/manifold_centers_dict.joblib
   down_block_types:
     - "DownBlock2D"
     - "DownBlock2D"

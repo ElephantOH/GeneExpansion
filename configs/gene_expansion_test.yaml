@@ -9,7 +9,7 @@ defaults:
   - _self_
   - data: train10m
   - machine: gpu
-  - model: manifold_diffusion_model_norm
+  - model: diffusion_model_norm
   - optimizer: adamw
   - scheduler: cosine
   - test: test1
@@ -24,10 +24,10 @@ test:
   seed: 42
   epoch: 4
   result_path: ${test.data_name}
-  solver: repaint_ddim
+  solver: manifold_dpm
 
 
-is_val: True
+is_val: False
 
 log:
   log_interval: 100

@@ -1,0 +1,22 @@
+data_name: test1
+
+
+_target_: src.data.gene_mask_dataset.GeneMaskDataModule
+image_size: 180
+batch_size: ${machine.batch_size}
+num_workers: ${machine.num_workers}
+tokenizer: ${machine.work_dir}/pretrain_model/PubMedBert
+mask_type: random
+mask_ratio: 0.3
+data_min: 0.0
+data_max: 6.0
+h5ad_paths:
+  train: None
+  test: ${machine.datasets_dir}/Test10M/test_6_top32400.h5ad
+  val: None
+
+map_paths:
+  train: ${machine.datasets_dir}/Train10M/gene_coordinates_32400.csv
+  test: ${machine.datasets_dir}/Train10M/gene_coordinates_32400.csv
+  val: ${machine.datasets_dir}/Train10M/gene_coordinates_32400.csv
+

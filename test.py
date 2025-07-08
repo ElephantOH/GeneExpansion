@@ -3,6 +3,8 @@ import os
 import hydra
 from omegaconf import DictConfig
 from pytorch_lightning import seed_everything
+from sympy.codegen.ast import continue_
+from torch.nn.functional import batch_norm
 from tqdm import tqdm
 from hydra.utils import instantiate
 import torch
@@ -23,7 +25,7 @@ class LogFileHandler:
             print(f"Error writing to log file: {e}")
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="gene_expansion")
+@hydra.main(version_base=None, config_path="configs", config_name="gene_expansion_test")
 def main(cfg: DictConfig):
     # 环境设置
     os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
@@ -39,7 +41,7 @@ def main(cfg: DictConfig):
     seed_everything(cfg.test.seed)
 
     # 日志初始化
-    log_file = os.path.join("test", datetime.datetime.now().strftime("%m-%d-%H-%M-%S") + ".log")
+    log_file = os.path.join("test", cfg.test.data_name, datetime.datetime.now().strftime("%m-%d-%H-%M-%S") + ".log")
 
     file_logger = None
     if fabric.is_global_zero:
@@ -47,13 +49,16 @@ def main(cfg: DictConfig):
         fabric.print(f"📝 日志保存到 {log_file}")
 
     # 准备测试数据
-    dataset = instantiate(cfg.data, _recursive_=False)
-    test_loader = fabric.setup_dataloaders(dataset.val_dataloader())
+    dataset = instantiate(cfg.test, _recursive_=False)
+    test_loader = fabric.setup_dataloaders(dataset.test_dataloader())
     fabric.print(f"📊 测试集大小: {len(test_loader.dataset)} 样本")
 
     # 构建模型
     model = instantiate(cfg.model)
     model = fabric.setup(model)
+
+    model.scheduler = cfg.test.solver
+    print(f"采样方式: {model.scheduler}")
 
     # 加载指定epoch的检查点
     target_epoch = cfg.test.epoch
@@ -89,8 +94,7 @@ def test(model, test_loader, fabric, cfg, file_logger=None):
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(test_loader):
-            if batch_idx >= 1:
-                break
+
             # 模型前向传播
             metrics = model.validation_step(batch, batch_idx, fabric, stage="test", solver=cfg.test.solver)
             # 累积指标

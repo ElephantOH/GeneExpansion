@@ -1,0 +1,23 @@
+data_name: train10m
+_target_: src.data.multi_file_gene_mask_dataset.MultiFileGeneMaskDataModule
+image_size: 180
+batch_size: ${machine.batch_size}
+num_workers: ${machine.num_workers}
+tokenizer: ${machine.work_dir}/pretrain_model/PubMedBert
+mask_type: true_mask
+mask_ratio: 0.85
+data_min: 0.0
+data_max: 6.0
+h5ad_paths:
+  train:
+    - ${machine.datasets_dir}/Train10M/adata_hvg_top32400_only.h5ad
+    - ${machine.datasets_dir}/Train10M/adata_hvg_top32400_only.h5ad
+  test: None
+  val:
+    - ${machine.datasets_dir}/Train10M/adata_hvg_top32400_only.h5ad
+
+map_paths:
+  train: ${machine.datasets_dir}/Train10M/gene_coordinates_32400.csv
+  test: ${machine.datasets_dir}/Train10M/gene_coordinates_32400.csv
+  val: ${machine.datasets_dir}/Train10M/gene_coordinates_32400.csv
+

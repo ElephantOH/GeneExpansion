@@ -1,0 +1,21 @@
+
+hydra:
+  run:
+    dir: outputs/${data.data_name}/${model.model_name}
+  job: # automatically go to the job folder (needed for hydra > 1.2 with new behavior)
+    chdir: true
+
+defaults:
+  - _self_
+  - machine: gpu
+  - data: test2m
+  - machine: gpu
+  - model: diffusion_model_norm
+
+h5ad_path: ${machine.datasets_dir}/Test2M/adata_hvg_top32400_only.h5ad
+map_path: ${machine.datasets_dir}/Test2M/gene_coordinates_32400.csv
+output_path: ${machine.work_dir}/pretrain_model/ManifoldData
+checkpoint_interval: 5
+data_min: 0.0
+data_max: 6.0
+device: "cuda:0"
