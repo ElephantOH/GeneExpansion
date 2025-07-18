@@ -25,7 +25,7 @@ class LogFileHandler:
             print(f"Error writing to log file: {e}")
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="gene_expansion_test")
+@hydra.main(version_base=None, config_path="configs", config_name="gene_expansion_test_m")
 def main(cfg: DictConfig):
     # 环境设置
     os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
@@ -94,6 +94,9 @@ def test(model, test_loader, fabric, cfg, file_logger=None):
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(test_loader):
+
+            # if batch_idx > 1:
+            #     break
 
             # 模型前向传播
             metrics = model.validation_step(batch, batch_idx, fabric, stage="test", solver=cfg.test.solver)

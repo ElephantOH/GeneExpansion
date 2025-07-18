@@ -1,7 +1,7 @@
 
 hydra:
   run:
-    dir: outputs/${data.data_name}/${model.model_name}
+    dir: results/${data.data_name}/${model.model_name}
   job: # automatically go to the job folder (needed for hydra > 1.2 with new behavior)
     chdir: true
 
@@ -9,7 +9,7 @@ defaults:
   - _self_
   - data: train10m
   - machine: gpu
-  - model: diffusion_model_norm
+  - model: manifold_diffusion_model_norm
   - optimizer: adamw
   - scheduler: cosine
   - test: test7
@@ -24,7 +24,7 @@ test:
   seed: 42
   epoch: 4
   result_path: ${test.data_name}
-  solver: inpaint_spgd
+  solver: manifold_ddim
 
 
 is_val: False

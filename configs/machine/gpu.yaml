@@ -3,5 +3,5 @@ defaults:
 
 accelerator: gpu
 devices: 1
-batch_size: 4
+batch_size: 2
 num_workers: 0

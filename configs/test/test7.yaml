@@ -1,4 +1,4 @@
-data_name: test1
+data_name: test7
 
 
 _target_: src.data.gene_mask_dataset.GeneMaskDataModule

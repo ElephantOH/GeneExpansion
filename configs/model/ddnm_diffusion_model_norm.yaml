@@ -1,0 +1,39 @@
+model_name: ddnm_diffusion_model_norm
+
+
+_target_: src.model.ddnm_diffusion_model.DDNMDiffusionModel
+model_config:
+  max_epochs: ${train.max_epochs}
+  sample_size: ${data.image_size}
+  in_channel: 1
+  out_channel: 1
+  text_encoder: ${machine.work_dir}/pretrain_model/PubMedBert
+  # text_encoder: lighteternal/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext-finetuned-mnli
+  train_text_encoder: False
+  cross_attention_dim: 768
+  layers_per_block: 2
+  block_out_channels: [ 64, 128, 256, 512 ]
+  ddpm_timesteps: 1000
+  ddim_timesteps: 50
+  dpm_timesteps: 50
+  resample_times: 1
+  map_path: ${data.map_paths.train}
+  test_data_name: ${test.data_name}
+  solver_type: ${test.solver}
+  result_path: ${test.result_path}
+  down_block_types:
+    - "DownBlock2D"
+    - "DownBlock2D"
+    - "CrossAttnDownBlock2D"
+    - "CrossAttnDownBlock2D"
+  up_block_types:
+    - "CrossAttnUpBlock2D"
+    - "CrossAttnUpBlock2D"
+    - "UpBlock2D"
+    - "UpBlock2D"
+  norm_num_groups: 32
+  time_embedding_type: "positional"
+  use_gradient_checkpointing: True
+
+  loss:
+    gene_corr_weight: 0.3

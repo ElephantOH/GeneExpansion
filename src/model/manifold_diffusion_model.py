@@ -1,3 +1,4 @@
+# v2025_7_17a
 import os
 from typing import Tuple
 
@@ -11,7 +12,7 @@ from scipy.optimize import linprog
 from torchmetrics.functional.image import structural_similarity_index_measure as ssim
 from src.model.diffusion_model import DiffusionModel
 
-#%%
+# %%
 
 from typing import Tuple
 import warnings
@@ -58,10 +59,29 @@ def fast_batch_modify_sequence(
         Y: torch.Tensor,
         A: torch.Tensor,
         B: torch.Tensor,
-        metric: str = 'l2',
+        metric: str = 'l1',
+        fabric=None
 ) -> torch.Tensor:
+    """
+        批量修改序列以满足目标平均值B，最小化指定距离度量 (支持L1, L2, MinMax)
+        目前修改只考虑l1和l2
+        参数:
+        X : (M, N) 原始序列值 ∈ [-1, 1]
+        Y : (M, N) 掩码 (1=不可修改, 0=可修改)
+        A : (M, 1) 初始平均值
+        B : (M, 1) 目标平均值
+        metric : 距离度量 ('l1', 'l2', 'minmax')
+
+        返回:
+        X_new : (M, N) 修改后的序列
+        """
     assert X.shape == Y.shape, "X and Y must have the same shape"
     assert A.shape == B.shape and A.dim() == 2 and A.shape[1] == 1, "A and B must be (M, 1) tensors"
+
+    if fabric is not None:
+        fabric.barrier()
+        device = fabric.device
+        X, Y, A, B = X.to(device), Y.to(device), A.to(device), B.to(device)
 
     if torch.all(Y == 1):
         return X
@@ -70,45 +90,137 @@ def fast_batch_modify_sequence(
     dtype = X.dtype
     M, N = X.shape
 
-    # 1. 并行计算关键张量
-    modifiable_mask = (Y == 0)
-    low_bounds = torch.clamp(-1 - X, min=-2, max=0)
-    up_bounds = torch.clamp(1 - X, min=0, max=2)
+    if metric == 'l1':
+        delta = (B - A) * N
+        modifiable_mask = (Y == 0)
 
-    # 2. 使用原地操作和预分配内存
-    delta = (B - A) * N
-    sum_low = torch.where(modifiable_mask, low_bounds, 0).sum(dim=1, keepdim=True)
-    sum_high = torch.where(modifiable_mask, up_bounds, 0).sum(dim=1, keepdim=True)
-    delta_clamped = torch.clamp(delta, min=sum_low, max=sum_high)
+        # 使用内存高效操作
+        low_bounds = torch.empty_like(X)
+        up_bounds = torch.empty_like(X)
+        torch.clamp(-1 - X, min=-2, max=0, out=low_bounds)
+        torch.clamp(1 - X, min=0, max=2, out=up_bounds)
+        low_bounds.masked_fill_(~modifiable_mask, 0)
+        up_bounds.masked_fill_(~modifiable_mask, 0)
 
-    # 3. 简化二分搜索（合并冗余计算）
-    lamb_low = torch.full((M, 1), -3.0, device=device, dtype=dtype)
-    lamb_high = torch.full((M, 1), 3.0, device=device, dtype=dtype)
-    diff_threshold = 1e-6  # 添加提前终止条件
+        sort_metric = low_bounds + up_bounds
+        sort_metric = sort_metric.masked_fill(
+            ~modifiable_mask, torch.finfo(dtype).max
+        )
 
-    # 4. 优化迭代：减少计算量并提前终止
-    for _ in range(20):  # 减少迭代次数（20次足够满足精度）
-        with torch.no_grad():
-            lamb_mid = (lamb_low + lamb_high) / 2
+        # 使用float32排序防止精度丢失
+        sorted_indices = torch.argsort(sort_metric.to(torch.float32), dim=1)
 
-            # 关键优化：避免全量expand_as和clamp
-            d_temp = torch.maximum(low_bounds, torch.minimum(up_bounds, lamb_mid))
-            sum_d = torch.where(modifiable_mask, d_temp, 0).sum(dim=1, keepdim=True)
+        # 高精度累加
+        low_vec = torch.gather(low_bounds, 1, sorted_indices).cumsum(1, dtype=torch.float32)
+        up_vec = torch.gather(up_bounds, 1, sorted_indices).cumsum(1, dtype=torch.float32)
 
-            # 更新搜索边界（使用原地操作）
-            update_mask = sum_d < delta_clamped
-            lamb_low = torch.where(update_mask, lamb_mid, lamb_low)
-            lamb_high = torch.where(~update_mask, lamb_mid, lamb_high)
+        # 关键计算转float32
+        target_vec = (low_vec + up_vec) / 2.0
+        delta_float = delta.to(torch.float32)
+        k_index = torch.searchsorted(target_vec, delta_float, right=False).clamp(0, N - 1)
 
-            # 提前终止检测：检查收敛性
-            if torch.all((lamb_high - lamb_low) < diff_threshold):
-                break
+        low_vals = torch.gather(low_vec, 1, k_index)
+        up_vals = torch.gather(up_vec, 1, k_index)
 
-    # 5. 使用已计算的中间值避免重复clamp
-    lamb_final = (lamb_low + lamb_high) / 2
-    d_final = torch.maximum(low_bounds, torch.minimum(up_bounds, lamb_final))
+        # 处理除零风险
+        N_minus_k = (N - k_index).clamp_min(1).to(torch.float32)
+        lambda_opt = (delta_float - (low_vals + up_vals) / 2) / N_minus_k
 
-    return torch.where(modifiable_mask, X + d_final, X)
+        # 输出转半精度
+        lambda_opt = lambda_opt.to(dtype).expand_as(X)
+        d = torch.clamp(lambda_opt, min=low_bounds, max=up_bounds)
+        return torch.where(modifiable_mask, X + d, X).to(dtype)
+
+    elif metric == 'l1_old':
+        # 计算每个问题所需的总变化量
+        delta = (B - A) * N  # (M,1)
+
+        modifiable_mask = (Y == 0)
+
+        # 修正1: 显式隔离不可修改位置
+        low_bounds = torch.clamp(-1 - X, min=-2, max=0).masked_fill(~modifiable_mask, 0)
+        up_bounds = torch.clamp(1 - X, min=0, max=2).masked_fill(~modifiable_mask, 0)
+
+        # 修正2: 构建安全的排序指标（不可修改位置置为inf）
+        sort_metric = low_bounds + up_bounds
+        sort_metric = sort_metric.masked_fill(~modifiable_mask, float('inf'))
+
+        sorted_indices = torch.argsort(sort_metric, dim=1)  # (M, N)
+
+        low_vec = torch.gather(low_bounds, 1, sorted_indices).cumsum(1, dtype=dtype)  # (M, N)
+        up_vec = torch.gather(up_bounds, 1, sorted_indices).cumsum(1, dtype=dtype)  # (M, N)
+
+        # 修正3: 使用delta原始维度(M,1)，避免squeeze
+        k_index = torch.searchsorted(
+            (low_vec + up_vec) / 2.0,
+            delta,  # 直接使用(M,1)!
+            right=False
+        ).clamp(0, N - 1)  # (M,1)
+
+        # 保持k_index为(M,1)用于gather
+        low_vals = torch.gather(low_vec, 1, k_index)  # (M,1)
+        up_vals = torch.gather(up_vec, 1, k_index)  # (M,1)
+
+        # 修正4: 安全类型转换
+        N_minus_k = (N - k_index).to(dtype)  # (M,1)
+
+        lambda_opt = (delta - (low_vals + up_vals) / 2) / N_minus_k  # (M,1)
+
+        # 计算变化量并应用
+        d = torch.clamp(
+            lambda_opt.expand_as(X),
+            min=low_bounds,
+            max=up_bounds
+        ).to(dtype)
+        return torch.where(modifiable_mask, X + d, X).to(dtype)
+
+    elif metric == "l2":
+
+        # 计算每个问题所需的总变化量
+        delta = (B - A) * N  # (M,1)
+
+        modifiable_mask = (Y == 0)
+
+        # 修正1: 显式隔离不可修改位置
+        low_bounds = torch.clamp(-1 - X, min=-2, max=0).masked_fill(~modifiable_mask, 0)
+        up_bounds = torch.clamp(1 - X, min=0, max=2).masked_fill(~modifiable_mask, 0)
+
+        # 修正2: 构建安全的排序指标（不可修改位置置为inf）
+        sort_metric = low_bounds + up_bounds
+        sort_metric = sort_metric.masked_fill(~modifiable_mask, float('inf'))
+
+        sum_low = torch.where(modifiable_mask, low_bounds, 0).sum(dim=1, keepdim=True)
+        sum_high = torch.where(modifiable_mask, up_bounds, 0).sum(dim=1, keepdim=True)
+        delta_clamped = torch.clamp(delta, min=sum_low, max=sum_high)
+
+        # 3. 简化二分搜索（合并冗余计算）
+        lamb_low = torch.full((M, 1), -3.0, device=device, dtype=dtype)
+        lamb_high = torch.full((M, 1), 3.0, device=device, dtype=dtype)
+        diff_threshold = 1e-6  # 添加提前终止条件
+
+        # 4. 优化迭代：减少计算量并提前终止
+        for _ in range(20):  # 减少迭代次数（20次足够满足精度）
+            with torch.no_grad():
+                lamb_mid = (lamb_low + lamb_high) / 2
+
+                # 关键优化：避免全量expand_as和clamp
+                d_temp = torch.maximum(low_bounds, torch.minimum(up_bounds, lamb_mid))
+                sum_d = torch.where(modifiable_mask, d_temp, 0).sum(dim=1, keepdim=True)
+
+                # 更新搜索边界（使用原地操作）
+                update_mask = sum_d < delta_clamped
+                lamb_low = torch.where(update_mask, lamb_mid, lamb_low)
+                lamb_high = torch.where(~update_mask, lamb_mid, lamb_high)
+
+                # 提前终止检测：检查收敛性
+                if torch.all((lamb_high - lamb_low) < diff_threshold):
+                    break
+
+        # 5. 使用已计算的中间值避免重复clamp
+        lamb_final = (lamb_low + lamb_high) / 2
+        d_final = torch.maximum(low_bounds, torch.minimum(up_bounds, lamb_final))
+
+        return torch.where(modifiable_mask, X + d_final, X)
 
 
 def batch_modify_sequence(
@@ -154,6 +266,38 @@ def batch_modify_sequence(
     up_bounds = torch.clamp(1 - X, min=0, max=2)
 
     if metric == 'l1':
+        # === 向量化 KKT 求解器 (O(MKlogK)) ===
+        # 计算每个可修改点的原始排序
+        sorted_indices = torch.argsort(low_bounds + up_bounds, dim=1)  # (M, N)
+
+        # 构造累积和向量
+        low_vec = torch.gather(low_bounds, 1, sorted_indices).cumsum(1)
+        up_vec = torch.gather(up_bounds, 1, sorted_indices).cumsum(1)
+
+        # 寻找最优阈值点 k
+        k_index = torch.searchsorted(
+            (low_vec + up_vec) / 2.0,
+            delta.expand(-1, N),
+            right=False
+        ).clamp(0, N - 1)
+
+        # 计算最优 lambda (广播索引)
+        idx_exp = k_index.unsqueeze(1).expand(-1, N)
+        low_vals = torch.gather(low_vec, 1, idx_exp[:, :1])
+        up_vals = torch.gather(up_vec, 1, idx_exp[:, :1])
+        lambda_opt = (delta - (low_vals + up_vals) / 2) / (N - k_index)
+
+        # 计算变化量 (使用向量化剪辑)
+        d = torch.clamp(
+            lambda_opt.expand_as(X),
+            min=low_bounds,
+            max=up_bounds
+        )
+
+        # 应用修改并计算距离
+        X_new = torch.where(modifiable_mask, X + d, X)
+
+    elif metric == 'l1_old':
         # ===== L1距离最小化 =====
         for i in range(M):
             if not modifiable_mask[i].any():
@@ -203,7 +347,7 @@ def batch_modify_sequence(
                 res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
                               bounds=bounds, method='highs')
             except Exception as e:
-                print(f"警告: 线性规划求解失败，问题{i}: {e}")
+                # print(f"警告: 线性规划求解失败，问题{i}: {e}")
                 # 使用回退方案（L2方法）
                 d_i = constrained_mean(delta_i, low_i, up_i, 'l2')
                 d_i_tensor = torch.tensor(d_i, device=device, dtype=dtype)
@@ -220,7 +364,7 @@ def batch_modify_sequence(
                 dist_values[i] = np.sum(np.abs(d_i))
             else:
                 # 使用回退方案（L2方法）
-                print(f"警告: L1优化失败，问题{i}")
+                # print(f"警告: L1优化失败，问题{i}")
                 d_i = constrained_mean(delta_i, low_i, up_i, 'l2')
                 d_i_tensor = torch.tensor(d_i, device=device, dtype=dtype)
                 X_new[i, mod_idx] = X[i, mod_idx] + d_i_tensor
@@ -271,7 +415,6 @@ def batch_modify_sequence(
 
         # 计算距离值
         d_abs = torch.where(modifiable_mask, torch.abs(d_final), 0)
-        dist_values = torch.sqrt(torch.sum(d_abs ** 2, dim=1))
 
 
     elif metric == 'minmax':
@@ -336,75 +479,20 @@ def batch_modify_sequence(
     return X_new
 
 
-#%%
+# %%
 
 class ManifoldDiffusionModel(DiffusionModel):
     def __init__(self, model_config: DictConfig, **kwargs):
         super().__init__(model_config)
         self.correction_steps = {
-                480 : list(range(78, 90)),
-                380 : list(range(56, 78)),
-                280 : list(range(34, 56)),
-                180 : list(range(12, 34)),
-                80 : list(range(0, 12))
-            }
+            480: list(range(78, 90)),
+            380: list(range(56, 78)),
+            280: list(range(34, 56)),
+            180: list(range(12, 34)),
+            80: list(range(0, 12))
+        }
         print("correction step: ", self.correction_steps)
         self.manifold_dictionary = joblib.load(self.config.manifold_path)
-
-    def fast_fast_projection(self, X, Y, T, max_iters=50, device='cuda'):
-        # 确保所有输入都在正确设备和类型
-        X = X.clone().detach().to(device).float().requires_grad_(True)
-        Y = Y.clone().detach().to(device).float() if isinstance(Y, torch.Tensor) else torch.tensor(Y,
-                                                                                                   dtype=torch.float32,
-                                                                                                   device=device)
-        T = T.clone().detach().to(device).float().abs()  # 提前取绝对值
-
-        # 预计算统计量
-        with torch.no_grad():
-            mean = Y.mean(dim=0, keepdim=True)
-            cov = torch.cov(Y.T)
-            cov_inv = torch.linalg.pinv(cov + 1e-6 * torch.eye(cov.size(0), device=device))
-
-            # 预计算Y的转置用于距离计算
-            Y_trans = Y.T.contiguous()  # 转置并确保内存连续
-
-        # 优化设置
-        delta = torch.zeros_like(X, requires_grad=True, device=device)
-        optimizer = torch.optim.LBFGS([delta], lr=0.2, max_iter=4, history_size=5, line_search_fn='strong_wolfe')
-
-        # 核心优化循环
-        for _ in range(max(max_iters // 4, 1)):
-            # 每次外层循环采样一次（减少采样频率）
-            with torch.no_grad():
-                rand_idx = torch.randint(0, Y.size(0), (50,), device=device)  # 增加到50点但只采样一次
-                sampled_Y = Y[rand_idx]
-
-            # 闭包函数（关键优化：减少计算图复杂度）
-            def closure():
-                optimizer.zero_grad()
-                X_hat = X + delta
-
-                # 优化1：使用矩阵乘法代替逐元素乘
-                diff = X_hat - mean
-                mal_dist = diff @ cov_inv @ diff.t()  # 高效计算马氏距离
-
-                # 优化2：直接计算最小距离（避免cdist开销）
-                dists = torch.sum((X_hat - sampled_Y) ** 2, dim=1).sqrt()
-                nn_dist = dists.min()
-
-                # 组合损失函数（保留原始加权系数）
-                loss = mal_dist.squeeze() + 0.2 * nn_dist
-                loss.backward()
-                return loss
-
-            # LBFGS优化步骤
-            optimizer.step(closure)
-
-            # 应用约束（使用预先abs处理的T）
-            with torch.no_grad():
-                delta.data.clamp_(-T, T)  # 就地操作更高效
-
-        return (X + delta).detach()
 
     def fast_projection(self, X, Y, T, max_iters=50, device='cuda'):
         # 确保所有输入都在正确设备和类型
@@ -460,8 +548,8 @@ class ManifoldDiffusionModel(DiffusionModel):
         # 返回结果，断开计算图
         return (X + delta).detach()
 
-
-    def correction(self, original, x0_pred, mask, scheduler, t, cell_type, text_emb, text_attn, modify_layer, device):
+    def correction(self, original, x0_pred, mask, scheduler, t, cell_type, text_emb, text_attn, modify_layer, fabric,
+                   device):
 
         x0_pred_cor = original * mask + x0_pred * (1 - mask)
         X_batch = self.get_sparse_code(x0_pred_cor)
@@ -493,7 +581,7 @@ class ManifoldDiffusionModel(DiffusionModel):
             A = X.mean(dim=1, keepdim=True)
             B = X_hat_batch[:, layer].unsqueeze(1)
 
-            Y_new = fast_batch_modify_sequence(X, Y, A, B, "l2")
+            Y_new = fast_batch_modify_sequence(X, Y, A, B, "l1_old")
 
             x0_pred_cor = self.restore_layer_i(x0_pred_cor, Y_new, layer)
 
@@ -550,7 +638,6 @@ class ManifoldDiffusionModel(DiffusionModel):
         positions = torch.nonzero(mask, as_tuple=True)
         return positions[0], positions[1]  # (rows, cols)
 
-
     def extract_layer_i(self, X: torch.Tensor, i: int) -> torch.Tensor:
         """
         提取图像X的第i切比雪夫层的所有像素值
@@ -582,7 +669,6 @@ class ManifoldDiffusionModel(DiffusionModel):
 
         # 重新组织形状为[B, num_pixels]
         return values.view(B, num_pixels)
-
 
     def restore_layer_i(self, X: torch.Tensor, Y: torch.Tensor, i: int) -> torch.Tensor:
         """
@@ -618,9 +704,9 @@ class ManifoldDiffusionModel(DiffusionModel):
 
         # 恢复值到目标层
         restored[batch_indices, row_indices, col_indices] = Y.flatten()
+        # .to(dtype=restored.dtype)
 
         return restored
-
 
     def get_sparse_code(self, gene_matrix):
         if gene_matrix.dim() == 4:
@@ -734,7 +820,8 @@ class ManifoldDiffusionModel(DiffusionModel):
 
             if prev_t in self.correction_steps and prev_t > 0:
                 modify_layer = self.correction_steps[t]
-                x_prev = self.correction(original, x_0_pred, mask, scheduler, t, cell_type, text_emb, text_attn, modify_layer, device)
+                x_prev = self.correction(original, x_0_pred, mask, scheduler, t, cell_type, text_emb, text_attn,
+                                         modify_layer, device)
 
             # 更新当前状态
             x_t = x_prev
@@ -807,7 +894,8 @@ class ManifoldDiffusionModel(DiffusionModel):
 
             if prev_t in self.correction_steps:
                 modify_layer = self.correction_steps[prev_t]
-                x_prev = self.correction(original, x_0_pred, mask, scheduler, t, cell_type, text_emb, text_attn, modify_layer, device)
+                x_prev = self.correction(original, x_0_pred, mask, scheduler, t, cell_type, text_emb, text_attn,
+                                         modify_layer, fabric, device)
 
             # 更新当前状态
             x_t = x_prev

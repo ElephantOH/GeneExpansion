@@ -174,6 +174,7 @@ class GeneMaskDataset(Dataset):
 
     def __getitem__(self, idx):
         # 加载基因矩阵
+        idx = idx + 1200
         gene_matrix = self.mapping_gene(self.reshape_gene(self.adata, idx))
         gene_matrix = torch.tensor(gene_matrix, dtype=torch.float32)
         gene_matrix = rearrange(gene_matrix, 'h w -> 1 h w')  # 添加通道维度
